@@ -1,27 +1,26 @@
-# Compiler and flags
-ifeq ($(CROSS_COMPILE),)
-    CC = gcc
+# Resolve compiler based on optional CROSS_COMPILE prefix
+ifeq ($(strip $(CROSS_COMPILE)),)
+CC := gcc
 else
-    CC = $(CROSS_COMPILE)gcc
+CC := $(CROSS_COMPILE)gcc
 endif
 
-CFLAGS = -Wall -Wextra -g
+CFLAGS ?= -Wall -Wextra -g
+LDFLAGS ?=
 
-# Target name
-TARGET = writer
+TARGET := writer
+SRCS := writer.c
+OBJS := $(SRCS:.c=.o)
 
-# Source files
-SRCS = writer.c
-OBJS = $(SRCS:.c=.o)
+.PHONY: all clean
 
-# Default target
+all: $(TARGET)
+
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# How to build .o files from .c
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Clean rule
 clean:
 	rm -f $(OBJS) $(TARGET)
