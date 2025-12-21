@@ -8,6 +8,9 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
 
 #define PORT 9000
 #define DATAFILE "/var/tmp/aesdsocketdata"
@@ -20,8 +23,240 @@ void signal_handler(int signo)
     stop = 1;
 }
 
+pthread_mutex_t mutex;
+
+struct slist_data_s
+{
+    pthread_t thread_id;
+    int client_fd;
+    int thread_complete_flag;
+    struct sockaddr_in addr;
+    SLIST_ENTRY(slist_data_s) entries;
+};
+
+void *timer_thread_function(void *arg)
+{
+    (void)arg; // Unused
+    while (!stop)
+    {
+        // Sleep for 10 seconds. 
+        // We use nanosleep loop or multiple short sleeps so we can react to 'stop' faster?
+        // For simplicity required by assignment description "every 10 seconds", 
+        // we can sleep 10s. If we need faster exit, we could loop 10 times 1s.
+        // But usually, simplest is best unless tests fail on timeout. 
+        // Let's assume standard sleep(10) is acceptable or handling signals handles the interrupt.
+        // Actually, sleep() returns early on signal, so if SIGTERM/SIGINT comes, it wakes up.
+        // But we handle signal in a handler that sets stop=1.
+        // The sleep will likely return remaining time if interrupted.
+        // We will just loop sleep.
+        
+        struct timespec ts;
+        ts.tv_sec = 10;
+        ts.tv_nsec = 0;
+        while(nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+             if(stop) break;
+        }
+        if(stop) break;
+
+        time_t t;
+        struct tm *tmp;
+        char t_str[200];
+        
+        t = time(NULL);
+        tmp = localtime(&t);
+        if (tmp == NULL) {
+             perror("localtime");
+             continue;
+        }
+
+        // RFC 2822 format: e.g., "Mon, 15 Aug 2005 15:52:01 +0000"
+        if (strftime(t_str, sizeof(t_str), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tmp) == 0) {
+             syslog(LOG_ERR, "strftime returned 0");
+             continue;
+        }
+
+        pthread_mutex_lock(&mutex);
+        FILE *file = fopen(DATAFILE, "a");
+        if (file == NULL)
+        {
+            perror("fopen");
+            syslog(LOG_ERR, "fopen(%s, \"a\") failed in timer: %s", DATAFILE, strerror(errno));
+            pthread_mutex_unlock(&mutex);
+            continue;
+        }
+        
+        if (fputs(t_str, file) == EOF)
+        {
+             syslog(LOG_ERR, "fputs failed in timer");
+        }
+        
+        fclose(file);
+        pthread_mutex_unlock(&mutex);
+    }
+    return NULL;
+}
+
+void *thread_function(void *thread_param)
+{
+    struct slist_data_s *thread_func_args = (struct slist_data_s *)thread_param;
+    int client_fd = thread_func_args->client_fd;
+    struct sockaddr_in client_addr = thread_func_args->addr;
+
+    syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
+
+    char buffer[1024];
+    ssize_t bytes_read;
+    
+    // Protect file access with mutex
+    // Note: This locks while reading from socket, which reduces concurrency but ensures
+    // the full packet is written atomically to the file as per the assignment simplified logic.
+    pthread_mutex_lock(&mutex);
+    
+    FILE *file = fopen(DATAFILE, "a");
+    if (file == NULL)
+    {
+        perror("fopen");
+        syslog(LOG_ERR, "fopen(%s, \"a\") failed: %s", DATAFILE, strerror(errno));
+        pthread_mutex_unlock(&mutex);
+        close(client_fd);
+        thread_func_args->thread_complete_flag = 1;
+        return NULL;
+    }
+
+    while ((bytes_read = read(client_fd, buffer, sizeof(buffer))) > 0)
+    {
+        char *newline = memchr(buffer, '\n', bytes_read);
+        size_t to_write = bytes_read;
+
+        if (newline)
+            to_write = (size_t)(newline - buffer) + 1;
+
+        if (fwrite(buffer, 1, to_write, file) != to_write)
+        {
+            syslog(LOG_ERR, "fwrite failed");
+            break;
+        }
+
+        if (newline)
+            break;
+    }
+
+    if (bytes_read < 0)
+    {
+        syslog(LOG_ERR, "read failed: %s", strerror(errno));
+    }
+
+    fclose(file);
+    pthread_mutex_unlock(&mutex);
+
+    // Now send back entire file contents to the client
+    pthread_mutex_lock(&mutex);
+    file = fopen(DATAFILE, "r");
+    if (file == NULL)
+    {
+        perror("fopen");
+        syslog(LOG_ERR, "fopen(%s, \"r\") failed: %s", DATAFILE, strerror(errno));
+        pthread_mutex_unlock(&mutex);
+        close(client_fd);
+        thread_func_args->thread_complete_flag = 1;
+        return NULL;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        syslog(LOG_ERR, "fseek failed: %s", strerror(errno));
+        fclose(file);
+        pthread_mutex_unlock(&mutex);
+        close(client_fd);
+        thread_func_args->thread_complete_flag = 1;
+        return NULL;
+    }
+
+    long file_size = ftell(file);
+    if (file_size < 0)
+    {
+        syslog(LOG_ERR, "ftell failed: %s", strerror(errno));
+        fclose(file);
+        pthread_mutex_unlock(&mutex);
+        close(client_fd);
+        thread_func_args->thread_complete_flag = 1;
+        return NULL;
+    }
+
+    rewind(file);
+
+    char *file_buffer = NULL;
+    if (file_size > 0)
+    {
+        file_buffer = malloc((size_t)file_size);
+        if (!file_buffer)
+        {
+            syslog(LOG_ERR, "malloc(%ld) failed", file_size);
+            fclose(file);
+            pthread_mutex_unlock(&mutex);
+            close(client_fd);
+            thread_func_args->thread_complete_flag = 1;
+            return NULL;
+        }
+
+        size_t bytes_read_file = fread(file_buffer, 1, (size_t)file_size, file);
+        if (bytes_read_file != (size_t)file_size)
+        {
+            syslog(LOG_ERR, "fread mismatch: read %zu expected %ld",
+                   bytes_read_file, file_size);
+            free(file_buffer);
+            fclose(file);
+            pthread_mutex_unlock(&mutex);
+            close(client_fd);
+            thread_func_args->thread_complete_flag = 1;
+            return NULL;
+        }
+    }
+
+    fclose(file);
+    pthread_mutex_unlock(&mutex);
+
+    // Send entire file, handling partial sends
+    ssize_t bytes_sent = 0;
+    while (bytes_sent < file_size)
+    {
+        ssize_t sent = send(client_fd,
+                            file_buffer + bytes_sent,
+                            (size_t)(file_size - bytes_sent),
+                            0);
+        if (sent < 0)
+        {
+            if (errno == EINTR)
+                continue;
+
+            perror("send");
+            syslog(LOG_ERR, "send failed: %s", strerror(errno));
+            break;
+        }
+        if (sent == 0)
+        {
+            // Peer closed
+            break;
+        }
+        bytes_sent += sent;
+    }
+
+    if (file_buffer)
+        free(file_buffer);
+
+    close(client_fd);
+    thread_func_args->thread_complete_flag = 1;
+    return thread_param;
+}
+
 int main(int argc, char *argv[])
 {
+    SLIST_HEAD(slisthead, slist_data_s) head;
+    SLIST_INIT(&head);
+
+
+    pthread_mutex_init(&mutex, NULL);
+    
     int server_fd = -1, client_fd = -1;
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
@@ -92,6 +327,7 @@ int main(int argc, char *argv[])
         freopen("/dev/null", "w", stderr);
     }
 
+
     if (listen(server_fd, 10) < 0)
     {
         perror("listen");
@@ -117,6 +353,16 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+    // Start timer thread
+    pthread_t timer_thread;
+    if (pthread_create(&timer_thread, NULL, timer_thread_function, NULL) != 0)
+    {
+        perror("pthread_create timer");
+        syslog(LOG_ERR, "Failed to create timer thread");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
     while (!stop)
     {
         addr_len = sizeof(client_addr);
@@ -133,141 +379,75 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        syslog(LOG_INFO, "Accepted connection from %s",
-               inet_ntoa(client_addr.sin_addr));
-
-        // Append incoming data to DATAFILE until newline seen
-        FILE *file = fopen(DATAFILE, "a");
-        if (file == NULL)
+        // Allocate memory for thread data
+        struct slist_data_s *datap = malloc(sizeof(struct slist_data_s));
+        if (datap == NULL)
         {
-            perror("fopen");
-            syslog(LOG_ERR, "fopen(%s, \"a\") failed: %s", DATAFILE, strerror(errno));
+            perror("malloc");
+            syslog(LOG_ERR, "malloc failed");
             close(client_fd);
             continue;
         }
 
-        char buffer[1024];
-        ssize_t bytes_read;
+        datap->client_fd = client_fd;
+        datap->addr = client_addr;
+        datap->thread_complete_flag = 0;
 
-        while ((bytes_read = read(client_fd, buffer, sizeof(buffer))) > 0)
+        if (pthread_create(&datap->thread_id, NULL, thread_function, datap) != 0)
         {
-            char *newline = memchr(buffer, '\n', bytes_read);
-            size_t to_write = bytes_read;
-
-            if (newline)
-                to_write = (size_t)(newline - buffer) + 1;
-
-            if (fwrite(buffer, 1, to_write, file) != to_write)
-            {
-                syslog(LOG_ERR, "fwrite failed");
-                break;
-            }
-
-            if (newline)
-                break;
-        }
-
-        if (bytes_read < 0)
-        {
-            syslog(LOG_ERR, "read failed: %s", strerror(errno));
-        }
-
-        fclose(file);
-
-        // Now send back entire file contents to the client
-        file = fopen(DATAFILE, "r");
-        if (file == NULL)
-        {
-            perror("fopen");
-            syslog(LOG_ERR, "fopen(%s, \"r\") failed: %s", DATAFILE, strerror(errno));
+            perror("pthread_create");
+            syslog(LOG_ERR, "pthread_create failed: %s", strerror(errno));
+            free(datap);
             close(client_fd);
             continue;
         }
 
-        if (fseek(file, 0, SEEK_END) != 0)
+        SLIST_INSERT_HEAD(&head, datap, entries);
+
+        // Check for completed threads and join them
+        struct slist_data_s *entry = NULL;
+        struct slist_data_s *next_entry = NULL;
+        
+        // Manual safe traversal
+        entry = SLIST_FIRST(&head);
+        while (entry != NULL)
         {
-            syslog(LOG_ERR, "fseek failed: %s", strerror(errno));
-            fclose(file);
-            close(client_fd);
-            continue;
-        }
-
-        long file_size = ftell(file);
-        if (file_size < 0)
-        {
-            syslog(LOG_ERR, "ftell failed: %s", strerror(errno));
-            fclose(file);
-            close(client_fd);
-            continue;
-        }
-
-        rewind(file);
-
-        char *file_buffer = NULL;
-        if (file_size > 0)
-        {
-            file_buffer = malloc((size_t)file_size);
-            if (!file_buffer)
+            next_entry = SLIST_NEXT(entry, entries);
+            if (entry->thread_complete_flag)
             {
-                syslog(LOG_ERR, "malloc(%ld) failed", file_size);
-                fclose(file);
-                close(client_fd);
-                continue;
+                pthread_join(entry->thread_id, NULL);
+                SLIST_REMOVE(&head, entry, slist_data_s, entries);
+                free(entry);
+                // We restart traversal or continue? 
+                // Since SLIST_REMOVE is correct, next_entry is still valid (it was entry->next).
+                // However, SLIST_REMOVE might be O(N).
             }
-
-            size_t bytes_read_file = fread(file_buffer, 1, (size_t)file_size, file);
-            if (bytes_read_file != (size_t)file_size)
-            {
-                syslog(LOG_ERR, "fread mismatch: read %zu expected %ld",
-                       bytes_read_file, file_size);
-                free(file_buffer);
-                fclose(file);
-                close(client_fd);
-                continue;
-            }
+            entry = next_entry;
         }
-
-        fclose(file);
-
-        // Send entire file, handling partial sends
-        ssize_t bytes_sent = 0;
-        while (bytes_sent < file_size)
-        {
-            ssize_t sent = send(client_fd,
-                                file_buffer + bytes_sent,
-                                (size_t)(file_size - bytes_sent),
-                                0);
-            if (sent < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-
-                perror("send");
-                syslog(LOG_ERR, "send failed: %s", strerror(errno));
-                break;
-            }
-            if (sent == 0)
-            {
-                // Peer closed
-                break;
-            }
-            bytes_sent += sent;
-        }
-
-        if (file_buffer)
-            free(file_buffer);
-
-        close(client_fd);
-        client_fd = -1;
     }
 
     // Clean up all resources
     if (server_fd >= 0)
         close(server_fd);
 
+    // Join any remaining threads
+    while (!SLIST_EMPTY(&head))
+    {
+        struct slist_data_s *entry = SLIST_FIRST(&head);
+        pthread_join(entry->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(entry);
+    }
+
+    // Join timer thread
+    pthread_cancel(timer_thread); // Cancel the sleep
+    pthread_join(timer_thread, NULL);
+
     remove(DATAFILE);
     syslog(LOG_INFO, "Server exiting");
     closelog();
+
+    pthread_mutex_destroy(&mutex);
 
     return 0;
 }
