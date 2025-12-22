@@ -137,6 +137,8 @@ void *thread_function(void *thread_param)
             break;
         }
 
+        fflush(file);
+
         if (newline)
             break;
     }
