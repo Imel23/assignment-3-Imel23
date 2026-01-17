@@ -3,8 +3,12 @@
 # If that is also empty, it defaults to standard gcc.
 CC ?= $(CROSS_COMPILE)gcc
 
+# Default to using the char device (1), can be overridden by "make USE_AESD_CHAR_DEVICE=0"
+USE_AESD_CHAR_DEVICE ?= 1
+
 # Append your required flags to whatever flags the environment provides
-CFLAGS += -Wall -Wextra -g -pthread
+# We add the -D flag to define the macro for the C code
+CFLAGS += -Wall -Wextra -g -pthread -DUSE_AESD_CHAR_DEVICE=$(USE_AESD_CHAR_DEVICE)
 LDFLAGS += -pthread
 
 TARGET := aesdsocket

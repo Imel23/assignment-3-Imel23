@@ -13,7 +13,15 @@
 #include <time.h>
 
 #define PORT 9000
-#define DATAFILE "/var/tmp/aesdsocketdata"
+#ifndef USE_AESD_CHAR_DEVICE
+    #define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+    #define DATAFILE "/dev/aesdchar"
+#else
+    #define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
 
 volatile sig_atomic_t stop = 0;
 
@@ -34,6 +42,7 @@ struct slist_data_s
     SLIST_ENTRY(slist_data_s) entries;
 };
 
+#if !USE_AESD_CHAR_DEVICE
 void *timer_thread_function(void *arg)
 {
     (void)arg; // Unused
@@ -95,6 +104,7 @@ void *timer_thread_function(void *arg)
     }
     return NULL;
 }
+#endif
 
 void *thread_function(void *thread_param)
 {
@@ -295,7 +305,9 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     remove(DATAFILE);
+#endif
 
     // Daemon mode if "-d" given
     if (argc > 1 && strcmp(argv[1], "-d") == 0)
@@ -356,6 +368,7 @@ int main(int argc, char *argv[])
     }
 
     // Start timer thread
+#if !USE_AESD_CHAR_DEVICE
     pthread_t timer_thread;
     if (pthread_create(&timer_thread, NULL, timer_thread_function, NULL) != 0)
     {
@@ -364,7 +377,7 @@ int main(int argc, char *argv[])
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-
+#endif
     while (!stop)
     {
         addr_len = sizeof(client_addr);
@@ -441,11 +454,13 @@ int main(int argc, char *argv[])
         free(entry);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     // Join timer thread
-    pthread_cancel(timer_thread); // Cancel the sleep
+    pthread_cancel(timer_thread);
     pthread_join(timer_thread, NULL);
-
     remove(DATAFILE);
+#endif
+
     syslog(LOG_INFO, "Server exiting");
     closelog();
 
