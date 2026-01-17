@@ -174,6 +174,10 @@ void *thread_function(void *thread_param)
         return NULL;
     }
 
+    char *file_buffer = NULL;
+    long file_size = 0;
+
+#if !USE_AESD_CHAR_DEVICE
     if (fseek(file, 0, SEEK_END) != 0)
     {
         syslog(LOG_ERR, "fseek failed: %s", strerror(errno));
@@ -184,7 +188,7 @@ void *thread_function(void *thread_param)
         return NULL;
     }
 
-    long file_size = ftell(file);
+    file_size = ftell(file);
     if (file_size < 0)
     {
         syslog(LOG_ERR, "ftell failed: %s", strerror(errno));
@@ -197,7 +201,6 @@ void *thread_function(void *thread_param)
 
     rewind(file);
 
-    char *file_buffer = NULL;
     if (file_size > 0)
     {
         file_buffer = malloc((size_t)file_size);
@@ -224,6 +227,28 @@ void *thread_function(void *thread_param)
             return NULL;
         }
     }
+#else
+    char temp_buf[1024];
+    size_t chunk_size;
+    
+    while ((chunk_size = fread(temp_buf, 1, sizeof(temp_buf), file)) > 0)
+    {
+        char *new_ptr = realloc(file_buffer, file_size + chunk_size);
+        if (!new_ptr)
+        {
+            syslog(LOG_ERR, "realloc failed");
+            if (file_buffer) free(file_buffer);
+            fclose(file);
+            pthread_mutex_unlock(&mutex);
+            close(client_fd);
+            thread_func_args->thread_complete_flag = 1;
+            return NULL;
+        }
+        file_buffer = new_ptr;
+        memcpy(file_buffer + file_size, temp_buf, chunk_size);
+        file_size += chunk_size;
+    }
+#endif
 
     fclose(file);
     pthread_mutex_unlock(&mutex);
