@@ -11,6 +11,8 @@
 #include <pthread.h>
 #include <sys/queue.h>
 #include <time.h>
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define PORT 9000
 #ifndef USE_AESD_CHAR_DEVICE
@@ -117,141 +119,88 @@ void *thread_function(void *thread_param)
     char buffer[1024];
     ssize_t bytes_read;
     
-    // Protect file access with mutex
-    // Note: This locks while reading from socket, which reduces concurrency but ensures
-    // the full packet is written atomically to the file as per the assignment simplified logic.
-    pthread_mutex_lock(&mutex);
-    
-    FILE *file = fopen(DATAFILE, "a");
-    if (file == NULL)
-    {
-        perror("fopen");
-        syslog(LOG_ERR, "fopen(%s, \"a\") failed: %s", DATAFILE, strerror(errno));
-        pthread_mutex_unlock(&mutex);
+    int aesd_fd = open(DATAFILE, O_RDWR);
+    if (aesd_fd < 0) {
+        perror("open " DATAFILE);
+        syslog(LOG_ERR, "open(%s) failed: %s", DATAFILE, strerror(errno));
         close(client_fd);
         thread_func_args->thread_complete_flag = 1;
         return NULL;
     }
 
-    while ((bytes_read = read(client_fd, buffer, sizeof(buffer))) > 0)
-    {
-        char *newline = memchr(buffer, '\n', bytes_read);
-        size_t to_write = bytes_read;
+    char *full_message_buffer = NULL;
+    size_t full_message_size = 0;
+    char temp_read_buffer[1024];
+    ssize_t bytes_received;
 
-        if (newline)
-            to_write = (size_t)(newline - buffer) + 1;
-
-        if (fwrite(buffer, 1, to_write, file) != to_write)
-        {
-            syslog(LOG_ERR, "fwrite failed");
-            break;
-        }
-
-        fflush(file);
-
-        if (newline)
-            break;
-    }
-
-    if (bytes_read < 0)
-    {
-        syslog(LOG_ERR, "read failed: %s", strerror(errno));
-    }
-
-    fclose(file);
-    pthread_mutex_unlock(&mutex);
-
-    // Now send back entire file contents to the client
-    pthread_mutex_lock(&mutex);
-    file = fopen(DATAFILE, "r");
-    if (file == NULL)
-    {
-        perror("fopen");
-        syslog(LOG_ERR, "fopen(%s, \"r\") failed: %s", DATAFILE, strerror(errno));
-        pthread_mutex_unlock(&mutex);
-        close(client_fd);
-        thread_func_args->thread_complete_flag = 1;
-        return NULL;
-    }
-
-    char *file_buffer = NULL;
-    long file_size = 0;
-
-#if !USE_AESD_CHAR_DEVICE
-    if (fseek(file, 0, SEEK_END) != 0)
-    {
-        syslog(LOG_ERR, "fseek failed: %s", strerror(errno));
-        fclose(file);
-        pthread_mutex_unlock(&mutex);
-        close(client_fd);
-        thread_func_args->thread_complete_flag = 1;
-        return NULL;
-    }
-
-    file_size = ftell(file);
-    if (file_size < 0)
-    {
-        syslog(LOG_ERR, "ftell failed: %s", strerror(errno));
-        fclose(file);
-        pthread_mutex_unlock(&mutex);
-        close(client_fd);
-        thread_func_args->thread_complete_flag = 1;
-        return NULL;
-    }
-
-    rewind(file);
-
-    if (file_size > 0)
-    {
-        file_buffer = malloc((size_t)file_size);
-        if (!file_buffer)
-        {
-            syslog(LOG_ERR, "malloc(%ld) failed", file_size);
-            fclose(file);
-            pthread_mutex_unlock(&mutex);
-            close(client_fd);
-            thread_func_args->thread_complete_flag = 1;
-            return NULL;
-        }
-
-        size_t bytes_read_file = fread(file_buffer, 1, (size_t)file_size, file);
-        if (bytes_read_file != (size_t)file_size)
-        {
-            syslog(LOG_ERR, "fread mismatch: read %zu expected %ld",
-                   bytes_read_file, file_size);
-            free(file_buffer);
-            fclose(file);
-            pthread_mutex_unlock(&mutex);
-            close(client_fd);
-            thread_func_args->thread_complete_flag = 1;
-            return NULL;
-        }
-    }
-#else
-    char temp_buf[1024];
-    size_t chunk_size;
-    
-    while ((chunk_size = fread(temp_buf, 1, sizeof(temp_buf), file)) > 0)
-    {
-        char *new_ptr = realloc(file_buffer, file_size + chunk_size);
-        if (!new_ptr)
-        {
+    while ((bytes_received = recv(client_fd, temp_read_buffer, sizeof(temp_read_buffer), 0)) > 0) {
+        char *newline_found = memchr(temp_read_buffer, '\n', bytes_received);
+        size_t current_chunk_size = bytes_received;
+        
+        char *new_full_buffer = realloc(full_message_buffer, full_message_size + current_chunk_size);
+        if (!new_full_buffer) {
             syslog(LOG_ERR, "realloc failed");
-            if (file_buffer) free(file_buffer);
-            fclose(file);
-            pthread_mutex_unlock(&mutex);
+            free(full_message_buffer);
+            close(aesd_fd);
             close(client_fd);
             thread_func_args->thread_complete_flag = 1;
             return NULL;
         }
-        file_buffer = new_ptr;
-        memcpy(file_buffer + file_size, temp_buf, chunk_size);
-        file_size += chunk_size;
-    }
-#endif
+        full_message_buffer = new_full_buffer;
+        memcpy(full_message_buffer + full_message_size, temp_read_buffer, current_chunk_size);
+        full_message_size += current_chunk_size;
 
-    fclose(file);
+        if (newline_found) {
+            break; 
+        }
+    }
+
+    if (bytes_received < 0) {
+        syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+    }
+
+    if (full_message_buffer && full_message_size > 0) {
+        const char *ioctl_prefix = "AESDCHAR_IOCSEEKTO:";
+        struct aesd_seekto_ioctl seek_to_cmd;
+        pthread_mutex_lock(&mutex);
+
+        if (strncmp(full_message_buffer, ioctl_prefix, strlen(ioctl_prefix)) == 0) {
+            if (sscanf(full_message_buffer + strlen(ioctl_prefix), "%u,%u", 
+                       &seek_to_cmd.write_cmd_num, &seek_to_cmd.write_cmd_offset) == 2) {
+                
+                syslog(LOG_DEBUG, "IOCTL command: seek to %u,%u", seek_to_cmd.write_cmd_num, seek_to_cmd.write_cmd_offset);
+                if (ioctl(aesd_fd, AESDCHAR_IOCSEEKTO, &seek_to_cmd)) {
+                    perror("ioctl failed");
+                }
+            } else {
+                syslog(LOG_ERR, "Malformed IOCTL command: %.*s", (int)full_message_size, full_message_buffer);
+            }
+        } else {
+            if (write(aesd_fd, full_message_buffer, full_message_size) < 0) {
+                perror("write to " DATAFILE " failed");
+            }
+        }
+        
+        pthread_mutex_unlock(&mutex);
+    }
+    
+    free(full_message_buffer); 
+
+    char read_back_buffer[1024];
+    ssize_t bytes_read_from_driver;
+
+    pthread_mutex_lock(&mutex);
+    while ((bytes_read_from_driver = read(aesd_fd, read_back_buffer, sizeof(read_back_buffer))) > 0) {
+        if (send(client_fd, read_back_buffer, bytes_read_from_driver, 0) < 0) {
+            perror("send failed");
+            break;
+        }
+    }
     pthread_mutex_unlock(&mutex);
+
+    if (bytes_read_from_driver < 0) {
+        perror("read from " DATAFILE " failed");
+    }
 
     // Send entire file, handling partial sends
     ssize_t bytes_sent = 0;
@@ -281,6 +230,7 @@ void *thread_function(void *thread_param)
     if (file_buffer)
         free(file_buffer);
 
+    close(aesd_fd);
     close(client_fd);
     thread_func_args->thread_complete_flag = 1;
     return thread_param;
