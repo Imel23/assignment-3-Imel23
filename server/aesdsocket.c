@@ -117,9 +117,6 @@ void *thread_function(void *thread_param)
 
     syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
 
-    char buffer[1024];
-    ssize_t bytes_read;
-    
     int aesd_fd = open(DATAFILE, O_RDWR);
     if (aesd_fd < 0) {
         perror("open " DATAFILE);
@@ -203,33 +200,6 @@ void *thread_function(void *thread_param)
         perror("read from " DATAFILE " failed");
     }
 
-    // Send entire file, handling partial sends
-    ssize_t bytes_sent = 0;
-    while (bytes_sent < file_size)
-    {
-        ssize_t sent = send(client_fd,
-                            file_buffer + bytes_sent,
-                            (size_t)(file_size - bytes_sent),
-                            0);
-        if (sent < 0)
-        {
-            if (errno == EINTR)
-                continue;
-
-            perror("send");
-            syslog(LOG_ERR, "send failed: %s", strerror(errno));
-            break;
-        }
-        if (sent == 0)
-        {
-            // Peer closed
-            break;
-        }
-        bytes_sent += sent;
-    }
-
-    if (file_buffer)
-        free(file_buffer);
 
     close(aesd_fd);
     close(client_fd);
