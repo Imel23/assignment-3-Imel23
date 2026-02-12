@@ -167,9 +167,9 @@ void *thread_function(void *thread_param)
 
         if (strncmp(full_message_buffer, ioctl_prefix, strlen(ioctl_prefix)) == 0) {
             if (sscanf(full_message_buffer + strlen(ioctl_prefix), "%u,%u", 
-                       &seek_to_cmd.write_cmd_num, &seek_to_cmd.write_cmd_offset) == 2) {
+                       &seek_to_cmd.write_cmd, &seek_to_cmd.write_cmd_offset) == 2) {
                 
-                syslog(LOG_DEBUG, "IOCTL command: seek to %u,%u", seek_to_cmd.write_cmd_num, seek_to_cmd.write_cmd_offset);
+                syslog(LOG_DEBUG, "IOCTL command: seek to %u,%u", seek_to_cmd.write_cmd, seek_to_cmd.write_cmd_offset);
                 if (ioctl(aesd_fd, AESDCHAR_IOCSEEKTO, &seek_to_cmd)) {
                     perror("ioctl failed");
                 }

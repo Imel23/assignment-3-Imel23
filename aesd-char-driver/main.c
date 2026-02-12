@@ -181,12 +181,12 @@ long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     if (mutex_lock_interruptible(&dev->lock)) {
         return -ERESTARTSYS;
     }
-    if (seek_to_data.write_cmd_num >= dev->circular_buffer.entry_count ||
-        seek_to_data.write_cmd_offset >= dev->circular_buffer.entry[(dev->circular_buffer.out_offs + seek_to_data.write_cmd_num) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED].size) {
+    if (seek_to_data.write_cmd >= dev->circular_buffer.entry_count ||
+        seek_to_data.write_cmd_offset >= dev->circular_buffer.entry[(dev->circular_buffer.out_offs + seek_to_data.write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED].size) {
         mutex_unlock(&dev->lock);
         return -EINVAL;
     }
-    for (i = 0; i < seek_to_data.write_cmd_num; i++) {
+    for (i = 0; i < seek_to_data.write_cmd; i++) {
         new_fpos += dev->circular_buffer.entry[(dev->circular_buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED].size;
     }
     new_fpos += seek_to_data.write_cmd_offset;
