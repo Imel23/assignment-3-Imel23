@@ -163,7 +163,7 @@ loff_t aesd_llseek(struct file *filp, loff_t offset, int whence) {
 
 long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-    struct aesd_seekto_ioctl seek_to_data;
+    struct aesd_seekto seek_to_data;
     struct aesd_dev *dev = filp->private_data;
     loff_t new_fpos = 0;
     size_t i;

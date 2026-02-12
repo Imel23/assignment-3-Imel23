@@ -12,6 +12,7 @@
 #include <sys/queue.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <fcntl.h>
 #include "../aesd-char-driver/aesd_ioctl.h"
 
 #define PORT 9000
@@ -161,7 +162,7 @@ void *thread_function(void *thread_param)
 
     if (full_message_buffer && full_message_size > 0) {
         const char *ioctl_prefix = "AESDCHAR_IOCSEEKTO:";
-        struct aesd_seekto_ioctl seek_to_cmd;
+        struct aesd_seekto seek_to_cmd;
         pthread_mutex_lock(&mutex);
 
         if (strncmp(full_message_buffer, ioctl_prefix, strlen(ioctl_prefix)) == 0) {
